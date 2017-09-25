@@ -27,7 +27,7 @@ func init() {
 		},
 		"sync": func() (cli.Command, error) {
 			return &command.ImportCommand{
-				Ui: ui,
+				Ui:    ui,
 				Purge: true,
 			}, nil
 		},

@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/consul/api"
 	"github.com/mitchellh/cli"
+	"sort"
 )
 
 type ImportCommand struct {
@@ -21,6 +22,8 @@ type ImportCommand struct {
 	parseAsYAML *bool
 	parseAsJSON *bool
 	parseAsTAR  *bool
+	dryMode     *bool
+	verbose     *bool
 	arrayGlue   *string
 	keyPrefix   *string
 	initialised bool
@@ -43,6 +46,8 @@ func (c *ImportCommand) init() {
 	c.parseAsYAML = c.flags.Bool("yaml", false, "Parse stdin as YAML")
 	c.parseAsJSON = c.flags.Bool("json", false, "Parse stdin as JSON")
 	c.parseAsTAR = c.flags.Bool("tar", false, "Parse stdin as a tarball")
+	c.dryMode = c.flags.Bool("dry", false, "Just output but not apply changes")
+	c.verbose = c.flags.Bool("verbose", false, "Output more detailed information")
 	c.arrayGlue = c.flags.String("glue", "\n", "Glue to use for joining array values")
 	c.keyPrefix = c.flags.String("prefix", "", "Consul tree to work under")
 	c.flags.Usage = func() { c.Ui.Output(c.Help()) }
@@ -105,46 +110,108 @@ func (c *ImportCommand) Run(args []string) int {
 func (c *ImportCommand) syncConsul(data map[string][]byte) error {
 	config := api.DefaultConfig()
 	client, err := api.NewClient(config)
+
 	if err != nil {
 		return err
 	}
+
 	kv := client.KV()
+
+	// Initialize statistics
 	deleted := 0
+	inserted := 0
 	updated := 0
-	if c.Purge {
-		pairs, _, err := kv.List(*c.keyPrefix, &api.QueryOptions{})
-		if err != nil {
-			return err
-		}
-		for _, pair := range pairs {
-			// if there was a prefix, we need to strip it
-			relativeKey := strings.TrimPrefix(pair.Key, *c.keyPrefix)
-			if val, ok := data[relativeKey]; ok {
-				if bytes.Equal(val, pair.Value) {
-					delete(data, relativeKey)
-				}
-			} else if c.Purge {
+
+	// Get remote key value pairs
+	pairs, _, err := kv.List(*c.keyPrefix, &api.QueryOptions{})
+	if err != nil {
+		return err
+	}
+
+	// Sort remote key value pairs
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i].Key < pairs[j].Key
+	})
+
+	// Index remote key value pairs
+	indexedPairs := make(map[string]*api.KVPair, len(pairs))
+	for _, pair := range pairs {
+		indexedPairs[pair.Key] = pair
+	}
+
+	// Enumerate remote key value pairs
+	for _, pair := range pairs {
+		// if there was a prefix, we need to strip it
+		relativeKey := strings.TrimPrefix(pair.Key, *c.keyPrefix)
+		if val, ok := data[relativeKey]; ok {
+			// Remote key exists in local keys
+
+			if bytes.Equal(val, pair.Value) {
+				// Remote and local key value pair is equal
+
+				// Remove from local key value pairs since no change is required
+				delete(data, relativeKey)
+			}
+		} else if c.Purge {
+			// Remote key does not exist in local key value pairs
+
+			// Delete in sync mode
+			if !*c.dryMode {
 				_, err := kv.Delete(pair.Key, nil)
 				if err != nil {
 					return err
-				} else {
-					deleted++
 				}
 			}
+
+			if *c.verbose {
+				c.Ui.Output(fmt.Sprintf("Delete key \"%s\" with value \"%s\"", pair.Key, string(pair.Value)))
+			}
+
+			deleted++
 		}
 	}
-	for key, val := range data {
-		_, err := kv.Put(c.toKVPair(key, val), nil)
-		if err != nil {
-			return err
-		} else {
+
+	// Sort local key value pairs
+	dataKeys := make([]string, 0, len(data))
+	for key, _ := range data {
+		dataKeys = append(dataKeys, key)
+	}
+	sort.Strings(dataKeys)
+
+	// Enumerate local key value pairs
+	for _, key := range dataKeys {
+		val := data[key]
+
+		if !*c.dryMode {
+			_, err := kv.Put(c.toKVPair(key, val), nil)
+			if err != nil {
+				return err
+			}
+		}
+
+		absoluteKey := *c.keyPrefix + key
+		if pair, ok := indexedPairs[absoluteKey]; ok {
+			// Local key exists in remote keys (Update)
+
+			if *c.verbose {
+				c.Ui.Output(fmt.Sprintf("Update key %s with value \"%s\" from previous value \"%s\"", key, string(val), string(pair.Value)))
+			}
+
 			updated++
+		} else {
+			// Local key does not exist in remote keys (Insert)
+			if *c.verbose {
+				c.Ui.Output(fmt.Sprintf("Insert key %s with value \"%s\"", key, string(val)))
+			}
+
+			inserted++
 		}
 	}
+
 	if c.Purge {
-		c.Ui.Output(fmt.Sprintf("Sync completed. %d keys deleted, %d keys updated.", deleted, updated))
+		c.Ui.Output(fmt.Sprintf("Sync completed. %d keys deleted, %d key inserted, %d keys updated.", deleted, inserted, updated))
 	} else {
-		c.Ui.Output(fmt.Sprintf("Import completed. %d keys set.", updated))
+		c.Ui.Output(fmt.Sprintf("Import completed. %d keys set.", inserted + updated))
 	}
 	return nil
 }
